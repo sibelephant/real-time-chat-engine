@@ -1,8 +1,27 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: chat_user
+      POSTGRES_PASSWORD: chat_pass
+      POSTGRES_DB: chat_engine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chat_user -d chat_engine"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -13,6 +32,7 @@ services:
     build: .
     environment:
       - PORT=3000
+      - DATABASE_URL=postgresql://chat_user:chat_pass@postgres:5432/chat_engine?schema=public
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - JWT_SECRET=shared-secret-for-all-instances
@@ -20,6 +40,8 @@ services:
       - RATE_LIMIT_TTL=60
       - RATE_LIMIT_MAX=30
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
@@ -28,6 +50,7 @@ services:
     build: .
     environment:
       - PORT=3000
+      - DATABASE_URL=postgresql://chat_user:chat_pass@postgres:5432/chat_engine?schema=public
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - JWT_SECRET=shared-secret-for-all-instances
@@ -35,6 +58,8 @@ services:
       - RATE_LIMIT_TTL=60
       - RATE_LIMIT_MAX=30
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
@@ -49,3 +74,7 @@ services:
       - app1
       - app2
     restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

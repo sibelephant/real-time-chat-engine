@@ -1,8 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { WsException } from '@nestjs/websockets';
 import { Server } from 'socket.io';
-import { v4 as uuidv4 } from 'uuid';
-import { RedisService } from '../redis/redis.service';
+import { PrismaService } from '../prisma/prisma.service';
 import { AuthenticatedSocket } from '../common/interfaces/socket.interface';
 import { SocketEvent } from '../common/enums/events.enum';
 
@@ -18,13 +17,13 @@ export interface RoomData {
 
 /**
  * Manages room lifecycle: creation, membership, authorization, and reconnection re-joins.
- * All state is stored in Redis for horizontal scaling compatibility.
+ * Persistent state is stored in PostgreSQL via Prisma.
  */
 @Injectable()
 export class RoomService {
     private readonly logger = new Logger(RoomService.name);
 
-    constructor(private readonly redisService: RedisService) { }
+    constructor(private readonly prisma: PrismaService) { }
 
     /**
      * Create a new room and add the creator as the first member.
@@ -34,29 +33,28 @@ export class RoomService {
         type: RoomType,
         creatorId: string,
     ): Promise<RoomData> {
-        const roomId = uuidv4();
-        const roomData: RoomData = {
-            id: roomId,
-            name,
+        const dbType = type === 'private' ? 'PRIVATE' : 'GROUP';
+
+        const room = await this.prisma.room.create({
+            data: {
+                name,
+                type: dbType,
+                creatorId,
+                members: {
+                    create: { userId: creatorId },
+                },
+            },
+        });
+
+        this.logger.log(`Room created: "${name}" (${room.id}) by ${creatorId}`);
+
+        return {
+            id: room.id,
+            name: room.name,
             type,
-            creatorId,
-            createdAt: new Date().toISOString(),
+            creatorId: room.creatorId,
+            createdAt: room.createdAt.toISOString(),
         };
-
-        // Store room metadata
-        await this.redisService.hmset(`room:${roomId}`, roomData as any);
-
-        // Add creator as member
-        await this.redisService.sadd(`room:${roomId}:members`, creatorId);
-
-        // Track room in user's room list
-        await this.redisService.sadd(`user:${creatorId}:rooms`, roomId);
-
-        // Track room in global rooms list
-        await this.redisService.sadd('rooms', roomId);
-
-        this.logger.log(`Room created: "${name}" (${roomId}) by ${creatorId}`);
-        return roomData;
     }
 
     /**
@@ -67,27 +65,32 @@ export class RoomService {
         roomId: string,
         server: Server,
     ): Promise<void> {
-        const room = await this.redisService.hgetall(`room:${roomId}`);
-        if (!room || !room.id) {
+        const room = await this.prisma.room.findUnique({
+            where: { id: roomId },
+        });
+
+        if (!room) {
             throw new WsException('Room not found');
         }
 
         const userId = client.data.userId;
 
-        // For private rooms, only invited users (already in members set) can join
-        if (room.type === 'private') {
-            const isMember = await this.redisService.sismember(
-                `room:${roomId}:members`,
-                userId,
-            );
-            if (!isMember) {
+        // For private rooms, only invited users (already in members) can join
+        if (room.type === 'PRIVATE') {
+            const membership = await this.prisma.roomMember.findUnique({
+                where: { userId_roomId: { userId, roomId } },
+            });
+            if (!membership) {
                 throw new WsException('Not authorized to join this private room');
             }
         }
 
-        // Add to members set and user's room list
-        await this.redisService.sadd(`room:${roomId}:members`, userId);
-        await this.redisService.sadd(`user:${userId}:rooms`, roomId);
+        // Upsert membership (idempotent join)
+        await this.prisma.roomMember.upsert({
+            where: { userId_roomId: { userId, roomId } },
+            update: {},
+            create: { userId, roomId },
+        });
 
         // Join the Socket.io room
         client.join(roomId);
@@ -115,8 +118,9 @@ export class RoomService {
     ): Promise<void> {
         const userId = client.data.userId;
 
-        await this.redisService.srem(`room:${roomId}:members`, userId);
-        await this.redisService.srem(`user:${userId}:rooms`, roomId);
+        await this.prisma.roomMember.deleteMany({
+            where: { userId, roomId },
+        });
 
         client.leave(roomId);
 
@@ -136,35 +140,39 @@ export class RoomService {
      * Get all members of a room.
      */
     async getRoomMembers(roomId: string): Promise<string[]> {
-        return this.redisService.smembers(`room:${roomId}:members`);
+        const members = await this.prisma.roomMember.findMany({
+            where: { roomId },
+            select: { userId: true },
+        });
+        return members.map((m) => m.userId);
     }
 
     /**
      * Get all rooms a user belongs to.
      */
     async getRoomsForUser(userId: string): Promise<RoomData[]> {
-        const roomIds = await this.redisService.smembers(`user:${userId}:rooms`);
-        const rooms: RoomData[] = [];
+        const memberships = await this.prisma.roomMember.findMany({
+            where: { userId },
+            include: { room: true },
+        });
 
-        for (const roomId of roomIds) {
-            const room = await this.redisService.hgetall(`room:${roomId}`);
-            if (room && room.id) {
-                rooms.push(room as unknown as RoomData);
-            }
-        }
-
-        return rooms;
+        return memberships.map((m) => ({
+            id: m.room.id,
+            name: m.room.name,
+            type: m.room.type === 'PRIVATE' ? 'private' as RoomType : 'group' as RoomType,
+            creatorId: m.room.creatorId,
+            createdAt: m.room.createdAt.toISOString(),
+        }));
     }
 
     /**
      * Check if a user is a member of a room.
      */
     async isMember(roomId: string, userId: string): Promise<boolean> {
-        const result = await this.redisService.sismember(
-            `room:${roomId}:members`,
-            userId,
-        );
-        return result === 1;
+        const membership = await this.prisma.roomMember.findUnique({
+            where: { userId_roomId: { userId, roomId } },
+        });
+        return !!membership;
     }
 
     /**
@@ -173,7 +181,12 @@ export class RoomService {
      */
     async rejoinRooms(client: AuthenticatedSocket): Promise<string[]> {
         const userId = client.data.userId;
-        const roomIds = await this.redisService.smembers(`user:${userId}:rooms`);
+        const memberships = await this.prisma.roomMember.findMany({
+            where: { userId },
+            select: { roomId: true },
+        });
+
+        const roomIds = memberships.map((m) => m.roomId);
 
         for (const roomId of roomIds) {
             client.join(roomId);
@@ -196,26 +209,32 @@ export class RoomService {
         inviterId: string,
         inviteeId: string,
     ): Promise<void> {
-        const room = await this.redisService.hgetall(`room:${roomId}`);
-        if (!room || !room.id) {
+        const room = await this.prisma.room.findUnique({
+            where: { id: roomId },
+        });
+
+        if (!room) {
             throw new WsException('Room not found');
         }
 
-        if (room.type !== 'private') {
+        if (room.type !== 'PRIVATE') {
             throw new WsException('Can only invite to private rooms');
         }
 
-        // Only room creator or existing members can invite
-        const isInviterMember = await this.redisService.sismember(
-            `room:${roomId}:members`,
-            inviterId,
-        );
+        // Only existing members can invite
+        const isInviterMember = await this.prisma.roomMember.findUnique({
+            where: { userId_roomId: { userId: inviterId, roomId } },
+        });
+
         if (!isInviterMember) {
             throw new WsException('Only room members can invite others');
         }
 
-        await this.redisService.sadd(`room:${roomId}:members`, inviteeId);
-        await this.redisService.sadd(`user:${inviteeId}:rooms`, roomId);
+        await this.prisma.roomMember.upsert({
+            where: { userId_roomId: { userId: inviteeId, roomId } },
+            update: {},
+            create: { userId: inviteeId, roomId },
+        });
 
         this.logger.log(
             `User ${inviterId} invited ${inviteeId} to room ${roomId}`,

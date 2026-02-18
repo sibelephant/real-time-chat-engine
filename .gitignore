@@ -29,5 +29,5 @@ coverage/
 *.swo
 .DS_Store
 
-# NestJS
-.nest-cli.json
+# Prisma
+generated/

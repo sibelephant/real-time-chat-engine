@@ -1,0 +1,82 @@
+// Prisma schema for real-time chat engine
+// PostgreSQL as primary persistent store
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ── User ────────────────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(uuid())
+  username  String   @unique
+  password  String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  createdRooms Room[]       @relation("RoomCreator")
+  memberships  RoomMember[]
+  messages     Message[]
+
+  @@map("users")
+}
+
+// ── Room ────────────────────────────────────────────────────────
+
+enum RoomType {
+  PRIVATE
+  GROUP
+}
+
+model Room {
+  id        String   @id @default(uuid())
+  name      String
+  type      RoomType @default(GROUP)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  creator   User         @relation("RoomCreator", fields: [creatorId], references: [id])
+  creatorId String       @map("creator_id")
+  members   RoomMember[]
+  messages  Message[]
+
+  @@map("rooms")
+}
+
+// ── Room Membership (join table) ────────────────────────────────
+
+model RoomMember {
+  id       String   @id @default(uuid())
+  joinedAt DateTime @default(now()) @map("joined_at")
+
+  // Relations
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String @map("user_id")
+  room   Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  roomId String @map("room_id")
+
+  @@unique([userId, roomId])
+  @@map("room_members")
+}
+
+// ── Message ─────────────────────────────────────────────────────
+
+model Message {
+  id        String   @id @default(uuid())
+  content   String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String @map("user_id")
+  room   Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  roomId String @map("room_id")
+
+  @@index([roomId, createdAt(sort: Desc)])
+  @@map("messages")
+}
